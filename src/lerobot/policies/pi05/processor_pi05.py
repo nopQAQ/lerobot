@@ -64,6 +64,9 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
 
         # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
+        if state.ndim == 3:
+            # [B, T, D] from observation_delta_indices when V-JEPA video clips are enabled
+            state = state[:, 0]
         state_np = state.cpu().numpy()
         discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 

@@ -1,0 +1,72 @@
+# π₀.₅  pi05_base -> pi05_libero
+# LeRobot does not load this YAML. Keep it in sync with run_pi05_libero_train.sh.
+#
+# OpenPI official (src/openpi/training/config.py, name="pi05_libero"):
+#   start from pi05_base
+#   physical-intelligence/libero
+#   30_000 steps, global batch 256
+#   CosineDecaySchedule(warmup=10_000, peak_lr=5e-5, decay_steps=1_000_000, decay_lr=5e-5)
+#   Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False)
+#   extra_delta_transform=False
+#   AdamW(clip_gradient_norm=1.0, weight_decay=1e-10, b1=0.9, b2=0.95)
+#   ema_decay=0.999   # JAX-only; LeRobot pi05 has no EMA flag
+
+run_id: pi05_base_libero
+run_root_dir: results/libero_PI
+seed: 42
+wandb_entity: null
+wandb_project: lerobot_liberoPI
+is_debug: false
+
+policy:
+  type: pi05
+  pretrained_path: /mnt/nas/code/models/lerobot_pi05_base
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  compile_model: false          # PPU: keep false (OpenPI has no torch.compile)
+  gradient_checkpointing: true
+  freeze_vision_encoder: false
+  train_expert_only: false
+  chunk_size: 10                # OpenPI action_horizon=10
+  n_action_steps: 10
+  use_relative_actions: false   # OpenPI extra_delta_transform=False (LIBERO already delta)
+  normalization_mapping:
+    ACTION: MEAN_STD
+    STATE: MEAN_STD
+    VISUAL: IDENTITY
+  optimizer_lr: 5.0e-05         # OpenPI peak_lr
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 1.0e-10
+  optimizer_grad_clip_norm: 1.0
+  scheduler_warmup_steps: 10000
+  scheduler_decay_steps: 30000  # = steps, so LeRobot will not auto-scale warmup
+  scheduler_decay_lr: 5.0e-05   # = peak_lr: flat 5e-5 after warmup (OpenPI decay_lr=peak)
+  empty_cameras: 0
+  rename_map:
+    observation.images.image: observation.images.base_0_rgb
+    observation.images.image2: observation.images.left_wrist_0_rgb
+  vjepa_enabled: false
+
+datasets:
+  repo_id: HuggingFaceVLA/libero   # LeRobot copy of physical-intelligence/libero
+  root: playground/Datasets/HuggingFaceVLA/libero
+  video_backend: torchcodec
+
+env:
+  type: libero
+  task: libero_spatial,libero_object,libero_goal,libero_10
+  control_mode: relative
+
+trainer:
+  num_gpus: 8
+  max_train_steps: 30000
+  batch_size: 32                # per GPU; OpenPI global batch = 8×32 = 256
+  num_workers: 4
+  save_interval: 5000
+  log_freq: 100                 # OpenPI log_interval=100
+  env_eval_freq: 0
+  eval_n_episodes: 10
+  eval_batch_size: 1
+  wandb_enable: true

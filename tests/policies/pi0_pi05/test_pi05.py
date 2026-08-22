@@ -27,8 +27,70 @@ from lerobot.policies.pi05 import (  # noqa: E402
     PI05Policy,
     make_pi05_pre_post_processors,  # noqa: E402
 )
+from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch  # noqa: E402
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
+
+
+def test_vjepa_scene_attention_is_strictly_auxiliary():
+    attention = torch.ones(1, 8, 8, dtype=torch.bool)
+    padding = torch.ones(1, 8, dtype=torch.bool)
+
+    restricted = PI05Pytorch._restrict_scene_query_attention(
+        None,
+        attention,
+        padding,
+        prefix_len=5,
+        scene_len=2,
+    )
+
+    base_prefix = slice(0, 3)
+    scene = slice(3, 5)
+    action = slice(5, 8)
+    assert restricted[:, scene, base_prefix].all()
+    assert not restricted[:, base_prefix, scene].any()
+    assert not restricted[:, scene, scene].any()
+    assert not restricted[:, scene, action].any()
+    assert not restricted[:, action, scene].any()
+    assert restricted[:, action, base_prefix].all()
+
+
+def test_vjepa_scene_tokens_do_not_shift_action_positions():
+    base_prefix_padding = torch.tensor([[True, True, False]])
+    scene_padding = torch.tensor([[True, True]])
+    suffix_padding = torch.tensor([[True, True]])
+
+    training_positions = PI05Pytorch._build_joint_position_ids(
+        torch.cat([base_prefix_padding, scene_padding], dim=1),
+        suffix_padding,
+        scene_len=2,
+    )
+    inference_positions = PI05Pytorch._build_joint_position_ids(
+        base_prefix_padding,
+        suffix_padding,
+    )
+
+    assert torch.equal(training_positions[:, -2:], inference_positions[:, -2:])
+
+
+def test_vjepa_float_clip_is_not_rescaled_twice():
+    class CaptureProcessor:
+        def __init__(self):
+            self.kwargs = None
+
+        def __call__(self, **kwargs):
+            self.kwargs = kwargs
+            return {"pixel_values_videos": kwargs["videos"].unsqueeze(0)}
+
+    processor = CaptureProcessor()
+    policy = object.__new__(PI05Policy)
+    object.__setattr__(policy, "vj_processor", processor)
+    clip = torch.rand(8, 3, 16, 16)
+
+    processed = PI05Policy._process_vjepa_clip(policy, clip)
+
+    assert processor.kwargs["do_rescale"] is False
+    assert torch.equal(processed, clip.unsqueeze(0))
 
 
 @require_cuda

@@ -103,6 +103,22 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
+    # Frozen V-JEPA2 alignment on PaliGemma prefix scene queries (off by default).
+    # Scene tokens are concatenated in embed_prefix; they are not PaliGemma text tokens.
+    vjepa_enabled: bool = False
+    vjepa_model_path: str = "/mnt/nas/code/starVLA/playground/Pretrained_models/vjepa2-vitl-fpc64-256"
+    vjepa_align_loss_type: str = "cosine"
+    vjepa_align_loss_scale: float = 0.5
+    vjepa_use_layerwise_alignment: bool = True
+    vjepa_layer_mapping: str = "uniform"
+    vjepa_include_at_inference: bool = False
+    vjepa_num_frames: int = 8
+    vjepa_spatial_pool_size: int = 8
+    vjepa_video_resolution: int = 256
+    # False: repeat the current primary-camera frame (bring-up). True: stack
+    # observation_delta_indices frames and use the primary camera clip.
+    vjepa_use_video_clip: bool = False
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -120,6 +136,19 @@ class PI05Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+
+        allowed_align = {"l1", "mse", "cosine", "smooth_l1", "mse_cosine", "cosine_mse"}
+        if self.vjepa_align_loss_type not in allowed_align:
+            raise ValueError(
+                f"Invalid vjepa_align_loss_type: {self.vjepa_align_loss_type}. "
+                f"Expected one of {sorted(allowed_align)}"
+            )
+        if self.vjepa_num_frames < 2:
+            raise ValueError(f"vjepa_num_frames must be >= 2, got {self.vjepa_num_frames}")
+        if self.vjepa_spatial_pool_size < 1:
+            raise ValueError(
+                f"vjepa_spatial_pool_size must be >= 1, got {self.vjepa_spatial_pool_size}"
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -163,7 +192,9 @@ class PI05Config(PreTrainedConfig):
         )
 
     @property
-    def observation_delta_indices(self) -> None:
+    def observation_delta_indices(self) -> list[int] | None:
+        if self.vjepa_enabled and self.vjepa_use_video_clip:
+            return list(range(self.vjepa_num_frames))
         return None
 
     @property
