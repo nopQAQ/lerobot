@@ -36,12 +36,12 @@ export NCCL_SOCKET_TIMEOUT_MS=360000
 #   num_train_steps = 30_000
 #   peak_lr       = 5e-5, warmup=10_000, decay_lr=5e-5
 #   action_horizon = 10, extra_delta_transform=False
-#   frozen vjepa2-vitl-fpc64-256, 8-frame clip, scene_len=256, align cosine scale=0.5
-#   scene reads image+language; image/language/action cannot read scene
+#   frozen vjepa2-vitl-fpc64-256, 8-frame clip, scene_len=256, align cosine scale=0.4, projector_lr=1e-4
+#   scene reads only image+language; image/language/action cannot read scene; no scene-to-scene
 #   scene does not shift action RoPE positions; inference uses no scene or V-JEPA teacher
 # === Please modify the following paths according to your environment ===
 config_yaml=./examples/LIBERO/train_files/pi05_libero_vjepa.yaml
-run_id="${RUN_ID:-$(date +%m%d)_pi05_base_libero_vjepa_v2}"
+run_id="${RUN_ID:-$(date +%m%d)_pi05_base_libero_vjepa_v3}"
 # === End of environment variable configuration ===
 ###########################################################################################
 
@@ -124,11 +124,22 @@ fi
 
 steps="${STEPS:-30000}"
 batch_size="${BATCH_SIZE:-32}"
-save_freq="${SAVE_FREQ:-5000}"
+# Default: only keep the final checkpoint (LeRobot also always saves at step==steps).
+save_freq="${SAVE_FREQ:-${steps}}"
+log_freq="${LOG_FREQ:-100}"
+warmup_steps="${SCHEDULER_WARMUP_STEPS:-10000}"
+if [ "${warmup_steps}" -gt "${steps}" ]; then
+  warmup_steps="${steps}"
+fi
 wandb_enable="${WANDB_ENABLE:-true}"
 num_workers="${NUM_WORKERS:-4}"
 effective_batch="$((batch_size * num_processes))"
 vjepa_use_video_clip="${VJEPA_USE_VIDEO_CLIP:-true}"
+vjepa_align_loss_scale="${VJEPA_ALIGN_LOSS_SCALE:-0.4}"
+vjepa_align_projector_lr="${VJEPA_ALIGN_PROJECTOR_LR:-1e-4}"
+grad_conflict_enabled="${GRAD_CONFLICT_ENABLED:-true}"
+grad_conflict_freq="${GRAD_CONFLICT_FREQ:-100}"
+grad_conflict_scope="paligemma_language_model"
 
 # pi05_base uses OpenPI camera names. Map LIBERO image/image2 onto them.
 # Do not set empty_cameras: base already has 3 cameras; missing wrist is zero-filled.
@@ -150,13 +161,19 @@ echo "run_id: ${run_id}"
 echo "pretrained: ${pretrained}  (OpenPI start: pi05_base)"
 echo "vjepa_model_path: ${vjepa_model_path}"
 echo "vjepa_use_video_clip: ${vjepa_use_video_clip}"
+echo "vjepa_align_loss_scale: ${vjepa_align_loss_scale}"
+echo "vjepa_align_projector_lr: ${vjepa_align_projector_lr}"
+echo "grad_conflict_enabled: ${grad_conflict_enabled}"
+echo "grad_conflict_freq: ${grad_conflict_freq}"
+echo "grad_conflict_scope: ${grad_conflict_scope}"
 echo "libero_root: ${libero_root}"
 echo "output_dir: ${output_dir}"
 echo "num_processes: ${num_processes}  (available=${available_gpus}, OpenPI=8)"
 echo "batch_size: ${batch_size} per GPU  (effective=${effective_batch}, OpenPI=256)"
 echo "steps: ${steps}  (OpenPI=30000)"
-echo "lr: 5e-5  warmup=10000  decay_lr=5e-5"
+echo "lr: 5e-5  warmup=${warmup_steps}  decay_lr=5e-5  (vjepa_align_projector_lr=${vjepa_align_projector_lr})"
 echo "save_freq: ${save_freq}"
+echo "log_freq: ${log_freq}"
 echo "DEBUG: ${DEBUG}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-}"
 echo "WANDB_ENABLE: ${wandb_enable}"
@@ -184,19 +201,23 @@ accelerate launch \
   --policy.optimizer_lr=5e-5 \
   --policy.optimizer_weight_decay=1e-10 \
   --policy.optimizer_grad_clip_norm=1.0 \
-  --policy.scheduler_warmup_steps=10000 \
+  --policy.scheduler_warmup_steps="${warmup_steps}" \
   --policy.scheduler_decay_steps="${steps}" \
   --policy.scheduler_decay_lr=5e-5 \
   --policy.vjepa_enabled=true \
   --policy.vjepa_model_path="${vjepa_model_path}" \
   --policy.vjepa_align_loss_type=cosine \
-  --policy.vjepa_align_loss_scale=0.5 \
+  --policy.vjepa_align_loss_scale="${vjepa_align_loss_scale}" \
+  --policy.vjepa_align_projector_lr="${vjepa_align_projector_lr}" \
   --policy.vjepa_use_layerwise_alignment=true \
   --policy.vjepa_layer_mapping=uniform \
   --policy.vjepa_num_frames=8 \
   --policy.vjepa_spatial_pool_size=8 \
   --policy.vjepa_video_resolution=256 \
   --policy.vjepa_use_video_clip="${vjepa_use_video_clip}" \
+  --policy.grad_conflict_enabled="${grad_conflict_enabled}" \
+  --policy.grad_conflict_freq="${grad_conflict_freq}" \
+  --policy.grad_conflict_scope="${grad_conflict_scope}" \
   --dataset.repo_id=HuggingFaceVLA/libero \
   --dataset.root="${libero_root}" \
   --output_dir="${output_dir}" \
@@ -205,7 +226,7 @@ accelerate launch \
   --batch_size="${batch_size}" \
   --steps="${steps}" \
   --save_freq="${save_freq}" \
-  --log_freq=100 \
+  --log_freq="${log_freq}" \
   --num_workers="${num_workers}" \
   --wandb.enable="${wandb_enable}" \
   --wandb.project=lerobot_liberoPI \

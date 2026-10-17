@@ -111,6 +111,7 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    compute_grad_conflict: bool = False,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -128,6 +129,7 @@ def update_policy(
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
         sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        compute_grad_conflict: Run an extra, isolated PI05 gradient probe before training.
 
     Returns:
         A tuple containing:
@@ -145,6 +147,35 @@ def update_policy(
     weight_stats = None
     if sample_weighter is not None:
         sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
+
+    if compute_grad_conflict:
+        unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
+        if not getattr(unwrapped_policy.config, "alignment_backend", None):
+            compute_grad_conflict = False
+        else:
+            # Keep PI05 optional dependencies lazy for all other policy types.
+            from lerobot.policies.pi05.grad_diagnostics import (
+                compute_grad_conflict_metrics as compute_pi05_grad_conflict_metrics,
+                select_language_model_layer_param_groups,
+            )
+
+            rng_devices = [accelerator.device.index] if accelerator.device.type == "cuda" else []
+            with torch.random.fork_rng(devices=rng_devices):
+                with accelerator.autocast():
+                    _, probe_output = unwrapped_policy.forward(
+                        batch, reduction="mean", return_loss_tensors=True
+                    )
+                probe_tensors = probe_output.pop("_loss_tensors")
+                probe_metrics = compute_pi05_grad_conflict_metrics(
+                    probe_tensors["action_loss"],
+                    probe_tensors["align_loss"],
+                    select_language_model_layer_param_groups(
+                        unwrapped_policy.model, unwrapped_policy.config.grad_conflict_scope
+                    ),
+                    unwrapped_policy.config.alignment_loss_scale,
+                )
+                train_metrics.update_metrics(probe_metrics)
+                del probe_tensors, probe_output
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
@@ -167,6 +198,10 @@ def update_policy(
                 output_dict[f"sample_weight_{key}"] = value
         else:
             loss, output_dict = policy.forward(batch)
+
+        # Graph-bearing probe tensors are private diagnostics and must never reach MetricsTracker.
+        if output_dict is not None:
+            output_dict.pop("_loss_tensors", None)
 
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
 
@@ -541,6 +576,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     dl_iter = cycle(dataloader)
 
     policy.train()
+    compute_grad_conflict_enabled = getattr(cfg.policy, "grad_conflict_enabled", False)
+    if accelerator.distributed_type == DistributedType.FSDP and compute_grad_conflict_enabled:
+        logging.warning("Disabling PI05 grad_conflict diagnostics under FSDP")
+        compute_grad_conflict_enabled = False
 
     train_metrics = {
         # Per-rank loss reflects only one shard of the global batch; mean recovers the loss DDP
@@ -602,6 +641,11 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
             sample_weighter=sample_weighter,
+            compute_grad_conflict=(
+                compute_grad_conflict_enabled
+                and step + 1 <= cfg.steps
+                and (step + 1) % cfg.policy.grad_conflict_freq == 0
+            ),
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we

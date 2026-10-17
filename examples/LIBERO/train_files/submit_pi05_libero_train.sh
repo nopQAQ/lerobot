@@ -28,7 +28,7 @@ RUN_ROOT_DIR="${RUN_ROOT_DIR:-${LEROBOT_ROOT}/results/libero_PI}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${RUN_ROOT_DIR}/${RUN_ID}}"
 export STEPS="${STEPS:-30000}"
 export BATCH_SIZE="${BATCH_SIZE:-32}"
-export SAVE_FREQ="${SAVE_FREQ:-5000}"
+export SAVE_FREQ="${SAVE_FREQ:-${STEPS}}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export PI05_PRETRAINED="${PI05_PRETRAINED:-/mnt/nas/code/models/lerobot_pi05_base}"
 

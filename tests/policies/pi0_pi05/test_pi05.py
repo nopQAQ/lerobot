@@ -18,16 +18,26 @@
 
 import pytest
 import torch
+from torch import nn
 
 pytest.importorskip("transformers")
 
+from lerobot.policies.common.vla_utils import make_att_2d_masks  # noqa: E402
 from lerobot.policies.factory import make_policy_config  # noqa: E402
 from lerobot.policies.pi05 import (  # noqa: E402
     PI05Config,
     PI05Policy,
     make_pi05_pre_post_processors,  # noqa: E402
 )
-from lerobot.policies.pi05.modeling_pi05 import PI05Pytorch  # noqa: E402
+from lerobot.policies.pi05.align import (  # noqa: E402
+    scene_prealign_consistency_stats,
+    scene_query_embedding_consistency_stats,
+)
+from lerobot.policies.pi05.modeling_pi05 import (  # noqa: E402
+    PI05Pytorch,
+    _reorder_prefix_scene_behind_action,
+    _restitch_attention_output_to_module_order,
+)
 from lerobot.utils.random_utils import set_seed
 from tests.utils import require_cuda, require_hf_token  # noqa: E402
 
@@ -40,13 +50,14 @@ def test_vjepa_scene_attention_is_strictly_auxiliary():
         None,
         attention,
         padding,
-        prefix_len=5,
+        prefix_len=3,
         scene_len=2,
+        action_len=3,
     )
 
     base_prefix = slice(0, 3)
-    scene = slice(3, 5)
-    action = slice(5, 8)
+    action = slice(3, 6)
+    scene = slice(6, 8)
     assert restricted[:, scene, base_prefix].all()
     assert not restricted[:, base_prefix, scene].any()
     assert not restricted[:, scene, scene].any()
@@ -55,22 +66,175 @@ def test_vjepa_scene_attention_is_strictly_auxiliary():
     assert restricted[:, action, base_prefix].all()
 
 
+def test_vjepa_attention_states_place_scene_after_action():
+    prefix = torch.arange(6, dtype=torch.float32).view(1, 1, 6, 1)
+    suffix = torch.arange(10, 13, dtype=torch.float32).view(1, 1, 3, 1)
+    reordered = _reorder_prefix_scene_behind_action([prefix, suffix], scene_len=2)
+
+    assert reordered.shape[2] == 9
+    assert torch.equal(reordered[0, 0, :4, 0], prefix[0, 0, :4, 0])
+    assert torch.equal(reordered[0, 0, 4:7, 0], suffix[0, 0, :, 0])
+    assert torch.equal(reordered[0, 0, 7:, 0], prefix[0, 0, 4:, 0])
+
+    restitched = _restitch_attention_output_to_module_order(
+        reordered.squeeze(1),
+        prefix_len=6,
+        suffix_len=3,
+        scene_len=2,
+    )
+    original = torch.cat([prefix, suffix], dim=2).squeeze(1)
+    assert torch.equal(restitched, original)
+
+
+def test_vjepa_scene_query_ids_follow_vlajepa_tubelet_layout():
+    temporal_tokens = 4
+    spatial_tokens = 64
+    token_ids = PI05Pytorch._scene_query_token_ids(
+        temporal_tokens, spatial_tokens, device=torch.device("cpu")
+    )
+    assert token_ids.shape == (temporal_tokens * spatial_tokens,)
+    for tubelet in range(temporal_tokens):
+        start = tubelet * spatial_tokens
+        end = start + spatial_tokens
+        assert torch.equal(token_ids[start:end], torch.full((spatial_tokens,), tubelet))
+
+
+def test_scene_prealign_stats_identical_tokens_are_consistent():
+    temporal = 4
+    spatial = 8
+    hidden = 6
+    token = torch.tensor([1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    scene = token.view(1, 1, hidden).expand(2, temporal * spatial, hidden).contiguous()
+    stats = scene_prealign_consistency_stats(scene, temporal)
+    assert stats["scene_prealign/pairwise_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert stats["scene_prealign/within_tubelet_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert stats["scene_prealign/between_tubelet_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert stats["scene_prealign/tubelet_mean_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert stats["scene_prealign/token_std"].item() == pytest.approx(0.0, abs=1e-5)
+
+    query = token.expand(temporal, hidden).contiguous()
+    query_stats = scene_query_embedding_consistency_stats(query)
+    assert query_stats["scene_prealign/query_pairwise_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert query_stats["scene_prealign/query_row_std"].item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_scene_prealign_stats_separate_tubelets_diverge():
+    temporal = 2
+    spatial = 4
+    t0 = torch.tensor([1.0, 0.0])
+    t1 = torch.tensor([0.0, 1.0])
+    scene = torch.cat(
+        [t0.expand(spatial, 2), t1.expand(spatial, 2)],
+        dim=0,
+    ).unsqueeze(0)
+    stats = scene_prealign_consistency_stats(scene, temporal)
+    assert stats["scene_prealign/within_tubelet_cosine"].item() == pytest.approx(1.0, abs=1e-5)
+    assert stats["scene_prealign/between_tubelet_cosine"].item() == pytest.approx(0.0, abs=1e-5)
+    assert stats["scene_prealign/tubelet_mean_cosine"].item() == pytest.approx(0.0, abs=1e-5)
+
+
+def test_vjepa_embed_scene_repeats_per_tubelet_embedding():
+    model = object.__new__(PI05Pytorch)
+    nn.Module.__init__(model)
+    model.config = PI05Config(dtype="float32")
+    model.vjepa_temporal_tokens = 2
+    spatial = model.config.vjepa_spatial_pool_size**2
+    model.vjepa_scene_len = 2 * spatial
+    model.scene_query = nn.Embedding.from_pretrained(
+        torch.tensor([[1.0, 0.0], [0.0, 1.0]]), freeze=False
+    )
+    scene_emb, pad_masks, _ = PI05Pytorch.embed_scene(
+        model, bsize=3, device=torch.device("cpu"), dtype=torch.float32
+    )
+    assert scene_emb.shape == (3, 2 * spatial, 2)
+    assert pad_masks.shape == (3, 2 * spatial)
+    assert torch.equal(scene_emb[0, :spatial], torch.tensor([1.0, 0.0]).expand(spatial, -1))
+    assert torch.equal(scene_emb[0, spatial:], torch.tensor([0.0, 1.0]).expand(spatial, -1))
+    assert torch.equal(scene_emb[0], scene_emb[1])
+
+
+def test_vjepa_block_masks_keep_scene_auxiliary_after_action():
+    pad = torch.ones(1, 8, dtype=torch.bool)
+    att_1d = torch.tensor([[0, 0, 0, 1, 0, 0, 1, 0]], dtype=torch.bool)
+    masks = make_att_2d_masks(pad, att_1d)
+    restricted = PI05Pytorch._restrict_scene_query_attention(
+        None,
+        masks,
+        pad,
+        prefix_len=3,
+        scene_len=2,
+        action_len=3,
+    )
+
+    base_prefix = slice(0, 3)
+    action = slice(3, 6)
+    scene = slice(6, 8)
+    assert restricted[:, scene, base_prefix].all()
+    assert not restricted[:, base_prefix, scene].any()
+    assert not restricted[:, scene, scene].any()
+    assert not restricted[:, scene, action].any()
+    assert not restricted[:, action, scene].any()
+    assert restricted[:, action, base_prefix].all()
+
+
+def test_vjepa_align_projector_uses_separate_lr():
+    class DummyProjector(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.fc = torch.nn.Linear(2, 2, bias=False)
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(2, 2, bias=False)
+            self.vjepa_align_projector = DummyProjector()
+
+    class DummyPolicy(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = PI05Config(
+                vjepa_enabled=True,
+                optimizer_lr=5e-5,
+                vjepa_align_projector_lr=1e-4,
+                vjepa_align_loss_scale=0.4,
+                dtype="float32",
+            )
+            self.model = DummyModel()
+
+    policy = DummyPolicy()
+    groups = PI05Policy.get_optim_params(policy)
+
+    assert len(groups) == 2
+    assert groups[0]["lr"] == pytest.approx(5e-5)
+    assert groups[1]["lr"] == pytest.approx(1e-4)
+    assert groups[1]["name"] == "vjepa_align_projector"
+    assert len(groups[0]["params"]) == 1
+    assert len(groups[1]["params"]) == 1
+    assert groups[1]["params"][0] is policy.model.vjepa_align_projector.fc.weight
+
+
 def test_vjepa_scene_tokens_do_not_shift_action_positions():
     base_prefix_padding = torch.tensor([[True, True, False]])
-    scene_padding = torch.tensor([[True, True]])
     suffix_padding = torch.tensor([[True, True]])
+    scene_padding = torch.tensor([[True, True]])
 
     training_positions = PI05Pytorch._build_joint_position_ids(
-        torch.cat([base_prefix_padding, scene_padding], dim=1),
+        base_prefix_padding,
         suffix_padding,
-        scene_len=2,
+        scene_pad_masks=scene_padding,
     )
     inference_positions = PI05Pytorch._build_joint_position_ids(
         base_prefix_padding,
         suffix_padding,
     )
 
-    assert torch.equal(training_positions[:, -2:], inference_positions[:, -2:])
+    prefix_len = base_prefix_padding.shape[1]
+    action_len = suffix_padding.shape[1]
+    assert torch.equal(
+        training_positions[:, prefix_len : prefix_len + action_len],
+        inference_positions[:, prefix_len:],
+    )
+    assert training_positions.shape[1] == prefix_len + action_len + scene_padding.shape[1]
 
 
 def test_vjepa_float_clip_is_not_rescaled_twice():

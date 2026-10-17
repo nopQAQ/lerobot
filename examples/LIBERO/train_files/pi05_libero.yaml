@@ -64,7 +64,7 @@ trainer:
   max_train_steps: 30000
   batch_size: 32                # per GPU; OpenPI global batch = 8×32 = 256
   num_workers: 4
-  save_interval: 5000
+  save_interval: 30000            # only keep the final 30k checkpoint
   log_freq: 100                 # OpenPI log_interval=100
   env_eval_freq: 0
   eval_n_episodes: 10

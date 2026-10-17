@@ -68,14 +68,30 @@ from .align import (
     compute_projected_align_loss,
     pool_vjepa_tubelet_tokens,
     reduce_align_loss_results,
+    scene_prealign_consistency_stats,
+    scene_query_embedding_consistency_stats,
 )
 from .configuration_pi05 import DEFAULT_IMAGE_SIZE, PI05Config
+from .teachers import load_alignment_teacher, teacher_image_batch
 
-_VJEPA_TEACHER_KEY_MARKERS = ("vj_encoder.", "vj_processor")
+_ALIGNMENT_TEACHER_KEY_MARKERS = ("vj_encoder.", "vj_processor")
 
 
-def _is_vjepa_teacher_key(key: str) -> bool:
-    return key.startswith("vj_encoder") or any(marker in key for marker in _VJEPA_TEACHER_KEY_MARKERS)
+def _is_alignment_teacher_key(key: str) -> bool:
+    return key.startswith(("vj_encoder", "_alignment_teacher.", "model._alignment_teacher.")) or any(
+        marker in key for marker in _ALIGNMENT_TEACHER_KEY_MARKERS
+    )
+
+
+def _loss_metrics(action_loss: Tensor, align_loss: Tensor | None, align_scale: float) -> dict[str, float]:
+    metrics = {
+        "action_loss/raw": float(action_loss.detach().float().item()),
+        "action_loss/weighted": float(action_loss.detach().float().item()),
+    }
+    if align_loss is not None:
+        metrics["align_loss/raw"] = float(align_loss.detach().float().item())
+        metrics["align_loss/weighted"] = float((align_scale * align_loss).detach().float().item())
+    return metrics
 
 
 def _take_current_frame(img: Tensor) -> tuple[Tensor, Tensor | None]:
@@ -98,8 +114,41 @@ class ActionSelectKwargs(TypedDict, total=False):
     execution_horizon: int | None
 
 
+def _reorder_prefix_scene_behind_action(states: list[Tensor], scene_len: int) -> Tensor:
+    """Reorder ``[prefix+scene, action]`` Q/K/V to ``[prefix | action | scene]``.
+
+    Scene tokens still live on the PaliGemma stream (same width / layer), but the
+    joint attention sequence places them after the action expert tokens.
+    """
+    prefix_states, suffix_states = states
+    prefix_len = prefix_states.shape[2]
+    if scene_len <= 0 or scene_len > prefix_len:
+        raise RuntimeError(f"Invalid scene_len={scene_len} for prefix sequence length {prefix_len}")
+    base_len = prefix_len - scene_len
+    return torch.cat(
+        [prefix_states[:, :, :base_len], suffix_states, prefix_states[:, :, base_len:]],
+        dim=2,
+    )
+
+
+def _restitch_attention_output_to_module_order(
+    att_output: Tensor,
+    prefix_len: int,
+    suffix_len: int,
+    scene_len: int,
+) -> Tensor:
+    """Map ``[prefix | action | scene]`` attention output back to ``[prefix+scene | action]``."""
+    base_len = prefix_len - scene_len
+    base_att = att_output[:, :base_len]
+    action_att = att_output[:, base_len : base_len + suffix_len]
+    scene_att = att_output[:, base_len + suffix_len :]
+    return torch.cat([base_att, scene_att, action_att], dim=1)
+
+
 # Define the complete layer computation function for gradient checkpointing
-def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb):
+def compute_layer_complete(
+    inputs_embeds, attention_mask, position_ids, adarms_cond, layers, rotary_emb, scene_len=0
+):
     query_states = []
     key_states = []
     value_states = []
@@ -116,10 +165,17 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
         query_states.append(query_state)
         key_states.append(key_state)
         value_states.append(value_state)
-    # Concatenate and process attention
-    query_states = torch.cat(query_states, dim=2)
-    key_states = torch.cat(key_states, dim=2)
-    value_states = torch.cat(value_states, dim=2)
+    # Concatenate and process attention. When scene tokens are present they sit at
+    # the end of the PaliGemma stream, but joint attention uses
+    # ``[image | language | action | scene]``.
+    if scene_len:
+        query_states = _reorder_prefix_scene_behind_action(query_states, scene_len)
+        key_states = _reorder_prefix_scene_behind_action(key_states, scene_len)
+        value_states = _reorder_prefix_scene_behind_action(value_states, scene_len)
+    else:
+        query_states = torch.cat(query_states, dim=2)
+        key_states = torch.cat(key_states, dim=2)
+        value_states = torch.cat(value_states, dim=2)
     dummy_tensor = torch.zeros(
         query_states.shape[0],
         query_states.shape[2],
@@ -146,6 +202,13 @@ def compute_layer_complete(inputs_embeds, attention_mask, position_ids, adarms_c
     # Get head_dim from the current layer, not from the model
     head_dim = paligemma_layer.self_attn.head_dim
     att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+    if scene_len:
+        att_output = _restitch_attention_output_to_module_order(
+            att_output,
+            prefix_len=inputs_embeds[0].shape[1],
+            suffix_len=inputs_embeds[1].shape[1],
+            scene_len=scene_len,
+        )
     # Process layer outputs
     outputs_embeds = []
     start_pos = 0
@@ -331,6 +394,7 @@ class PaliGemmaWithExpertModel(
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
         collect_prefix_scene_len: int | None = None,
+        scene_len: int = 0,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -385,6 +449,7 @@ class PaliGemmaWithExpertModel(
                         preserve_rng_state=False,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        scene_len=scene_len,
                     )
                 else:
                     inputs_embeds = compute_layer_complete(
@@ -394,6 +459,7 @@ class PaliGemmaWithExpertModel(
                         adarms_cond,
                         layers=layers,
                         rotary_emb=rotary_emb,
+                        scene_len=scene_len,
                     )
                 if prefix_scene_hiddens is not None:
                     prefix_scene_hiddens.append(inputs_embeds[0][:, -collect_prefix_scene_len:])
@@ -474,7 +540,37 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             tubelet_size = 2
             self.vjepa_temporal_tokens = config.vjepa_num_frames // tubelet_size
             self.vjepa_scene_len = self.vjepa_temporal_tokens * (config.vjepa_spatial_pool_size**2)
-            self.scene_query = nn.Embedding(1, paligemma_config.width)
+            self._init_scene_query_from_language_embeddings()
+
+        self.alignment_scene_len = 0
+        self.alignment_layer_pairs = []
+        backend = config.alignment_backend
+        if backend in {"vggtomega", "locateanything"}:
+            query = nn.Embedding(1, paligemma_config.width)
+            language_weight = (
+                self.paligemma_with_expert.paligemma.model.language_model.get_input_embeddings().weight
+            )
+            with torch.no_grad():
+                query.weight.copy_(language_weight.detach().float().mean(dim=0, keepdim=True))
+            setattr(self, f"{backend}_scene_query", query)
+            teacher_dim = 2048 if backend == "vggtomega" else config.locateanything_teacher_dim
+            teacher_layers = 24 if backend == "vggtomega" else config.locateanything_teacher_layers
+            setattr(
+                self,
+                f"{backend}_align_projector",
+                AlignProjector(
+                    llm_dim=paligemma_config.width,
+                    vggt_dim=teacher_dim,
+                    align_loss_type=getattr(config, f"{backend}_align_loss_type"),
+                    use_vlm_norm=True,
+                    use_target_norm=getattr(config, f"{backend}_use_target_norm"),
+                ),
+            )
+            self.alignment_layer_pairs = build_align_layer_pairs(
+                student_num_layers=paligemma_config.depth,
+                teacher_num_layers=teacher_layers,
+                layer_mapping=getattr(config, f"{backend}_layer_mapping"),
+            )
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -527,7 +623,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         )
 
     def embed_prefix(
-        self, images, img_masks, tokens, masks, include_scene: bool = False
+        self, images, img_masks, tokens, masks
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer."""
         embs = []
@@ -559,19 +655,6 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        if include_scene and self.scene_query is not None and self.vjepa_scene_len > 0:
-            bsize = lang_emb.shape[0]
-            scene_emb = self.scene_query.weight.to(dtype=lang_emb.dtype, device=lang_emb.device)
-            scene_emb = scene_emb.expand(bsize, self.vjepa_scene_len, -1)
-            embs.append(scene_emb)
-            pad_masks.append(
-                torch.ones(bsize, self.vjepa_scene_len, dtype=torch.bool, device=lang_emb.device)
-            )
-            # 1D att_mask stays 0 so make_att_2d_masks still treats the prefix as one
-            # block. Image/language vs scene visibility is applied afterwards in
-            # _restrict_scene_query_attention.
-            att_masks += [0] * self.vjepa_scene_len
-
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -581,36 +664,124 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         return embs, pad_masks, att_masks
 
+    def _init_scene_query_from_language_embeddings(self) -> None:
+        """Initialize per-tubelet scene queries like VLA-JEPA latent tokens.
+
+        VLA-JEPA registers one special token per timestep (``<|action_i|>``) and
+        repeats it spatially; new rows are filled with the mean of the existing
+        language embedding table (``init_strategy=avg``).
+        """
+        paligemma_width = get_gemma_config(self.config.paligemma_variant).width
+        if self.vjepa_temporal_tokens <= 0:
+            raise RuntimeError("vjepa_temporal_tokens must be set before initializing scene_query")
+        self.scene_query = nn.Embedding(self.vjepa_temporal_tokens, paligemma_width)
+        lang_weight = self.paligemma_with_expert.paligemma.model.language_model.get_input_embeddings().weight
+        with torch.no_grad():
+            ref = lang_weight.detach().mean(dim=0).to(dtype=self.scene_query.weight.dtype)
+            self.scene_query.weight.copy_(ref.unsqueeze(0).expand_as(self.scene_query.weight))
+
+    @staticmethod
+    def _scene_query_token_ids(temporal_tokens: int, spatial_tokens: int, device: torch.device) -> Tensor:
+        """Map a flattened scene sequence onto per-tubelet embedding ids.
+
+        Layout matches pooled V-JEPA tokens: ``[t0 x H x W | t1 x H x W | ...]``.
+        """
+        return torch.arange(temporal_tokens, device=device).repeat_interleave(spatial_tokens)
+
+    @property
+    def active_scene_query(self):
+        backend = getattr(self.config, "alignment_backend", None)
+        if backend in {"vggtomega", "locateanything"}:
+            return getattr(self, f"{backend}_scene_query")
+        return self.scene_query
+
+    @property
+    def active_scene_len(self) -> int:
+        if getattr(self.config, "alignment_backend", None) in {"vggtomega", "locateanything"}:
+            return self.alignment_scene_len
+        return self.vjepa_scene_len
+
+    def embed_scene(
+        self, bsize: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Embed auxiliary V-JEPA scene queries that sit after the action suffix."""
+        if getattr(self.config, "alignment_backend", None) in {"vggtomega", "locateanything"}:
+            length = self.active_scene_len
+            if length <= 0:
+                raise RuntimeError("Teacher tokens must be extracted before embedding scene queries")
+            embeddings = self.active_scene_query(torch.zeros(length, dtype=torch.long, device=device))
+            embeddings = embeddings.to(dtype).unsqueeze(0).expand(bsize, -1, -1)
+            padding = torch.ones(bsize, length, dtype=torch.bool, device=device)
+            attention = torch.zeros_like(padding)
+            attention[:, 0] = True
+            return embeddings, padding, attention
+        if self.scene_query is None or self.vjepa_scene_len <= 0:
+            raise RuntimeError("embed_scene requires an initialized scene_query")
+        spatial_tokens = self.config.vjepa_spatial_pool_size**2
+        expected_len = self.vjepa_temporal_tokens * spatial_tokens
+        if expected_len != self.vjepa_scene_len:
+            raise RuntimeError(
+                f"scene_len {self.vjepa_scene_len} != temporal {self.vjepa_temporal_tokens} "
+                f"* spatial {spatial_tokens}"
+            )
+        if self.scene_query.num_embeddings != self.vjepa_temporal_tokens:
+            raise RuntimeError(
+                f"scene_query has {self.scene_query.num_embeddings} rows, "
+                f"expected {self.vjepa_temporal_tokens} temporal tokens"
+            )
+        token_ids = self._scene_query_token_ids(self.vjepa_temporal_tokens, spatial_tokens, device=device)
+        scene_emb = self.scene_query(token_ids).to(dtype=dtype)
+        scene_emb = scene_emb.unsqueeze(0).expand(bsize, -1, -1).contiguous()
+        pad_masks = torch.ones(bsize, self.vjepa_scene_len, dtype=torch.bool, device=device)
+        # New attention block after actions so make_att_2d_masks already prevents
+        # action → scene. Scene is further restricted to image+language only
+        # (no scene-to-scene) in _restrict_scene_query_attention.
+        att_masks = [1] + ([0] * (self.vjepa_scene_len - 1))
+        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=device)
+        att_masks = att_masks[None, :].expand(bsize, self.vjepa_scene_len)
+        return scene_emb, pad_masks, att_masks
+
     def _restrict_scene_query_attention(
         self,
         att_2d_masks: Tensor,
         pad_masks: Tensor,
         prefix_len: int,
         scene_len: int,
+        action_len: int | None = None,
+        scene_key_mask: Tensor | None = None,
     ) -> Tensor:
-        """Scene queries attend only to image+language; VLM/action cannot attend to scene.
+        """Scene queries attend only to image+language.
 
-        Sequence layout is ``[image | language | scene | suffix?]``. Scene is the
-        last ``scene_len`` tokens of the prefix. Scene-to-scene attention is
-        blocked (QwenOFT ``image_and_instruction``). The action suffix is also
-        blocked from scene keys, so the scene branch is strictly auxiliary.
+        Sequence layout is ``[image | language | suffix | scene]``. Scene is the
+        last ``scene_len`` tokens. Image/language/action cannot attend to scene,
+        and scene cannot attend to action or to other scene tokens, so the scene
+        branch stays a set of independent queries over the VLM prefix.
         """
         if scene_len <= 0:
             return att_2d_masks
         seq_len = att_2d_masks.shape[-1]
-        scene_start = prefix_len - scene_len
-        scene_end = prefix_len
-        if scene_start < 0 or scene_end > seq_len:
+        if action_len is None:
+            action_len = seq_len - prefix_len - scene_len
+        if action_len < 0:
+            raise RuntimeError(
+                f"Invalid action_len={action_len} for prefix_len={prefix_len}, "
+                f"scene_len={scene_len}, seq_len={seq_len}"
+            )
+        scene_start = prefix_len + action_len
+        scene_end = scene_start + scene_len
+        if scene_start < prefix_len or scene_end > seq_len:
             raise RuntimeError(
                 f"Invalid scene attention span [{scene_start}, {scene_end}) for "
-                f"prefix_len={prefix_len}, scene_len={scene_len}, seq_len={seq_len}"
+                f"prefix_len={prefix_len}, action_len={action_len}, "
+                f"scene_len={scene_len}, seq_len={seq_len}"
             )
 
         att_2d_masks = att_2d_masks.clone()
         att_2d_masks[:, :scene_start, scene_start:scene_end] = False
         att_2d_masks[:, scene_start:scene_end, :] = False
-        att_2d_masks[:, scene_start:scene_end, :scene_start] = True
-        att_2d_masks[:, scene_end:, scene_start:scene_end] = False
+        att_2d_masks[:, scene_start:scene_end, :prefix_len] = (
+            True if scene_key_mask is None else scene_key_mask[:, None, :]
+        )
         pad_queries = pad_masks[:, :, None]
         pad_keys = pad_masks[:, None, :]
         return att_2d_masks & pad_queries & pad_keys
@@ -619,14 +790,22 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _build_joint_position_ids(
         prefix_pad_masks: Tensor,
         suffix_pad_masks: Tensor,
-        scene_len: int = 0,
+        scene_pad_masks: Tensor | None = None,
     ) -> Tensor:
-        """Build RoPE positions without letting auxiliary scene tokens shift actions."""
+        """Build RoPE positions with scene tokens after actions.
+
+        Action positions continue from image+language only, matching inference
+        (which never inserts scene tokens). Scene positions start after the
+        action chunk so they cannot shift action RoPE.
+        """
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        base_prefix_masks = prefix_pad_masks[:, :-scene_len] if scene_len > 0 else prefix_pad_masks
-        suffix_offsets = torch.sum(base_prefix_masks, dim=-1, keepdim=True)
+        suffix_offsets = torch.sum(prefix_pad_masks, dim=-1, keepdim=True)
         suffix_position_ids = suffix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-        return torch.cat([prefix_position_ids, suffix_position_ids], dim=1)
+        if scene_pad_masks is None:
+            return torch.cat([prefix_position_ids, suffix_position_ids], dim=1)
+        scene_offsets = suffix_offsets + torch.sum(suffix_pad_masks, dim=-1, keepdim=True)
+        scene_position_ids = scene_offsets + torch.cumsum(scene_pad_masks, dim=1) - 1
+        return torch.cat([prefix_position_ids, suffix_position_ids, scene_position_ids], dim=1)
 
     def embed_suffix(self, noisy_actions, timestep):
         """Embed noisy_actions, timestep to prepare for Expert Gemma processing."""
@@ -678,16 +857,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         time,
         include_scene: bool = False,
         return_scene_hiddens: bool = False,
+        instruction_mask: Tensor | None = None,
     ) -> Tensor | tuple[Tensor, list[Tensor] | None]:
         """Do a full training forward pass and compute the loss."""
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, tokens, masks, include_scene=include_scene
-        )
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, tokens, masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(x_t, time)
+
+        scene_len = 0
+        scene_embs = None
+        scene_pad_masks = None
+        scene_att_masks = None
+        if include_scene and self.active_scene_query is not None and self.active_scene_len > 0:
+            scene_embs, scene_pad_masks, scene_att_masks = self.embed_scene(
+                prefix_embs.shape[0], prefix_embs.device, prefix_embs.dtype
+            )
+            scene_len = self.active_scene_len
 
         if (
             self.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -695,29 +883,56 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         ):
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
+            if scene_embs is not None:
+                scene_embs = scene_embs.to(dtype=torch.bfloat16)
 
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        if scene_len:
+            vlm_embs = torch.cat([prefix_embs, scene_embs], dim=1)
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks, scene_pad_masks], dim=1)
+            att_masks = torch.cat(
+                [
+                    prefix_att_masks.to(dtype=suffix_att_masks.dtype),
+                    suffix_att_masks,
+                    scene_att_masks.to(dtype=suffix_att_masks.dtype),
+                ],
+                dim=1,
+            )
+        else:
+            vlm_embs = prefix_embs
+            pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        if include_scene and self.vjepa_scene_len > 0:
+        scene_key_mask = None
+        backend = self.config.alignment_backend
+        if scene_len and backend in {"vggtomega", "locateanything"}:
+            image_len = prefix_pad_masks.shape[1] - tokens.shape[1]
+            scene_key_mask = prefix_pad_masks.clone()
+            scene_key_mask[:, image_len:] = False
+            if getattr(self.config, f"{backend}_scene_attention_mask_mode") == "image_and_instruction":
+                if instruction_mask is None or instruction_mask.shape != masks.shape:
+                    raise ValueError(
+                        "Teacher alignment requires the PI05 instruction mask from its preprocessor"
+                    )
+                scene_key_mask[:, image_len:] = instruction_mask.bool() & masks.bool()
+        if scene_len:
             att_2d_masks = self._restrict_scene_query_attention(
                 att_2d_masks,
                 pad_masks,
                 prefix_len=prefix_pad_masks.shape[1],
-                scene_len=self.vjepa_scene_len,
+                scene_len=scene_len,
+                action_len=suffix_pad_masks.shape[1],
+                scene_key_mask=scene_key_mask,
             )
         position_ids = self._build_joint_position_ids(
             prefix_pad_masks,
             suffix_pad_masks,
-            scene_len=self.vjepa_scene_len if include_scene else 0,
+            scene_pad_masks=scene_pad_masks,
         )
 
         att_2d_masks_4d = prepare_attention_masks_4d(att_2d_masks)
-        collect_scene_len = (
-            self.vjepa_scene_len if (include_scene and return_scene_hiddens and self.vjepa_scene_len > 0) else None
-        )
-        layerwise = bool(self.config.vjepa_use_layerwise_alignment)
+        collect_scene_len = scene_len if (include_scene and return_scene_hiddens and scene_len > 0) else None
+        layerwise = bool(getattr(self.config, f"{backend}_use_layerwise_alignment", False))
         scene_hiddens = None
 
         if collect_scene_len:
@@ -727,10 +942,11 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
+                inputs_embeds=[vlm_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
                 collect_prefix_scene_len=collect_scene_len if layerwise else None,
+                scene_len=scene_len,
             )
             if layerwise:
                 scene_hiddens = self.paligemma_with_expert._prefix_scene_hiddens
@@ -746,11 +962,12 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     inputs_embeds=[prefix_embs, suffix_embs],
                     use_cache=False,
                     adarms_cond=[None, adarms_cond],
+                    scene_len=scene_len,
                 )
                 return suffix_out
 
             suffix_out = self._apply_checkpoint(
-                forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+                forward_func, vlm_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
             )
 
         suffix_out = suffix_out[:, -self.config.chunk_size :]
@@ -795,22 +1012,13 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
 
         # V-JEPA alignment is training-only. Inference follows the original PI0.5
         # path and never inserts scene tokens.
-        include_scene = False
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images,
             img_masks,
             tokens,
             masks,
-            include_scene=include_scene,
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        if include_scene and self.vjepa_scene_len > 0:
-            prefix_att_2d_masks = self._restrict_scene_query_attention(
-                prefix_att_2d_masks,
-                prefix_pad_masks,
-                prefix_len=prefix_pad_masks.shape[1],
-                scene_len=self.vjepa_scene_len,
-            )
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -903,6 +1111,7 @@ class PI05Policy(PreTrainedPolicy):
         self.vj_processor = None
         self._vjepa_model_path = None
         self._vjepa_clip_btchw = None
+        self._alignment_teacher = None
 
         # Initialize the core PI05 model
         self.init_rtc_processor()
@@ -1005,12 +1214,25 @@ class PI05Policy(PreTrainedPolicy):
                 print(f"Remapped {remap_count} state dict keys")
 
             # Load the remapped state dict into the model.
-            # V-JEPA adds scene_query / align_projector (random init from pi05_base) and a
-            # frozen encoder loaded from its own checkpoint, so strict load cannot be used.
-            strict_load = False if getattr(model.config, "vjepa_enabled", False) else strict
+            # V-JEPA adds per-tubelet scene_query / align_projector (vocab-mean init
+            # from PaliGemma embeddings, not present in pi05_base) and a frozen
+            # encoder loaded from its own checkpoint, so strict load cannot be used.
+            strict_load = False if model.config.alignment_backend else strict
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict_load)
-            missing_keys = [k for k in missing_keys if not _is_vjepa_teacher_key(k)]
-            unexpected_keys = [k for k in unexpected_keys if not _is_vjepa_teacher_key(k)]
+            backend = model.config.alignment_backend
+            if (
+                backend in {"vggtomega", "locateanything"}
+                and f"model.{backend}_scene_query.weight" in missing_keys
+            ):
+                # Initialize new queries from the loaded base vocabulary, not
+                # from the random embeddings created before checkpoint loading.
+                language_weight = model.model.paligemma_with_expert.paligemma.model.language_model.get_input_embeddings().weight
+                with torch.no_grad():
+                    model.model.active_scene_query.weight.copy_(
+                        language_weight.detach().float().mean(dim=0, keepdim=True)
+                    )
+            missing_keys = [k for k in missing_keys if not _is_alignment_teacher_key(k)]
+            unexpected_keys = [k for k in unexpected_keys if not _is_alignment_teacher_key(k)]
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")
@@ -1103,20 +1325,46 @@ class PI05Policy(PreTrainedPolicy):
         return fixed_state_dict
 
     def get_optim_params(self) -> dict:
-        if not self.config.vjepa_enabled:
+        backend = getattr(self.config, "alignment_backend", "vjepa" if self.config.vjepa_enabled else None)
+        if backend is None:
             return self.parameters()
-        return [p for p in self.parameters() if p.requires_grad]
+
+        projector = getattr(self.model, f"{backend}_align_projector")
+        projector_ids = {id(param) for param in projector.parameters()} if projector is not None else set()
+        projector_params = []
+        other_params = []
+        for param in self.parameters():
+            if not param.requires_grad:
+                continue
+            if id(param) in projector_ids:
+                projector_params.append(param)
+            else:
+                other_params.append(param)
+
+        if not projector_params:
+            return other_params
+
+        return [
+            {"params": other_params, "lr": self.config.optimizer_lr},
+            {
+                "params": projector_params,
+                "lr": getattr(self.config, f"{backend}_align_projector_lr"),
+                "name": f"{backend}_align_projector",
+            },
+        ]
 
     def train(self, mode: bool = True):
         super().train(mode)
         if self.vj_encoder is not None:
             self.vj_encoder.eval()
+        if self._alignment_teacher is not None:
+            self._alignment_teacher.eval()
         return self
 
     def _save_pretrained(self, save_directory: Path, state_dict: dict[str, Tensor] | None = None) -> None:
         if state_dict is None:
             state_dict = self.state_dict()
-        state_dict = {key: value for key, value in state_dict.items() if not _is_vjepa_teacher_key(key)}
+        state_dict = {key: value for key, value in state_dict.items() if not _is_alignment_teacher_key(key)}
         super()._save_pretrained(save_directory, state_dict=state_dict)
 
     def _init_vjepa_alignment(self) -> None:
@@ -1140,6 +1388,11 @@ class PI05Policy(PreTrainedPolicy):
         self.model.vjepa_scene_len = self.model.vjepa_temporal_tokens * (
             self.config.vjepa_spatial_pool_size**2
         )
+        if (
+            self.model.scene_query is None
+            or self.model.scene_query.num_embeddings != self.model.vjepa_temporal_tokens
+        ):
+            self.model._init_scene_query_from_language_embeddings()
         self.model.vjepa_teacher_dim = int(vj_config.hidden_size)
         paligemma_width = get_gemma_config(self.config.paligemma_variant).width
         self.model.vjepa_align_projector = AlignProjector(
@@ -1158,9 +1411,13 @@ class PI05Policy(PreTrainedPolicy):
         )
         logging.info(
             "V-JEPA prefix alignment enabled "
-            f"(scene_len={self.model.vjepa_scene_len}, teacher_dim={self.model.vjepa_teacher_dim}, "
+            f"(scene_len={self.model.vjepa_scene_len}, "
+            f"temporal_tokens={self.model.vjepa_temporal_tokens}, "
+            f"teacher_dim={self.model.vjepa_teacher_dim}, "
             f"layerwise={self.config.vjepa_use_layerwise_alignment}, "
-            f"pairs={len(self.model.vjepa_layer_pairs)})"
+            f"pairs={len(self.model.vjepa_layer_pairs)}, "
+            f"align_scale={self.config.vjepa_align_loss_scale}, "
+            f"projector_lr={self.config.vjepa_align_projector_lr})"
         )
 
     def _ensure_vjepa_teacher(self) -> None:
@@ -1327,7 +1584,9 @@ class PI05Policy(PreTrainedPolicy):
 
         return actions
 
-    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
+    def forward(
+        self, batch: dict[str, Tensor], reduction: str = "mean", *, return_loss_tensors: bool = False
+    ) -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training.
 
         Args:
@@ -1346,7 +1605,20 @@ class PI05Policy(PreTrainedPolicy):
         time = self.model.sample_time(actions.shape[0], actions.device)
 
         # Compute loss (no separate state needed for PI05)
-        include_scene = bool(self.config.vjepa_enabled)
+        backend = self.config.alignment_backend
+        include_scene = backend is not None
+        teacher_layers = None
+        if backend in {"vggtomega", "locateanything"}:
+            if self._alignment_teacher is None:
+                self._alignment_teacher = load_alignment_teacher(self.config, actions.device)
+            # Use the first configured real camera, never silently substitute a wrist view.
+            main_key = next(iter(self.config.image_features))
+            if main_key not in batch:
+                raise ValueError(f"Alignment main camera is missing: {main_key}")
+            pixels = teacher_image_batch(batch[main_key]).to(actions.device)
+            with torch.no_grad():
+                teacher_layers = self._alignment_teacher(pixels, batch.get("raw_task"))
+            self.model.alignment_scene_len = teacher_layers[0].shape[1]
         model_out = self.model.forward(
             images,
             img_masks,
@@ -1357,6 +1629,7 @@ class PI05Policy(PreTrainedPolicy):
             time,
             include_scene=include_scene,
             return_scene_hiddens=include_scene,
+            instruction_mask=batch.get("observation.language.instruction_mask"),
         )
         if include_scene:
             losses, scene_hiddens = model_out
@@ -1374,27 +1647,48 @@ class PI05Policy(PreTrainedPolicy):
 
         align_loss = None
         if include_scene and scene_hiddens is not None:
-            video = self._prepare_vjepa_video(images)
-            teacher_layers = self._vjepa_encoder_layer_tokens(video)
-            align_loss, align_components = self._compute_vjepa_align_loss(scene_hiddens, teacher_layers)
-            loss_dict.update({key: value.detach() for key, value in align_components.items()})
-            loss_dict["align_loss"] = align_loss.detach()
+            prealign = scene_prealign_consistency_stats(
+                scene_hiddens[-1], self.model.vjepa_temporal_tokens if backend == "vjepa" else 1
+            )
+            if self.model.active_scene_query is not None:
+                prealign.update(scene_query_embedding_consistency_stats(self.model.active_scene_query.weight))
+            loss_dict.update({key: value.detach().float().item() for key, value in prealign.items()})
+            if backend == "vjepa":
+                video = self._prepare_vjepa_video(images)
+                teacher_layers = self._vjepa_encoder_layer_tokens(video)
+            align_loss, align_components = self._compute_alignment_loss(scene_hiddens, teacher_layers)
+            for key, value in align_components.items():
+                metric_key = (
+                    key
+                    if key.startswith("align_loss/layer_")
+                    else f"align_loss/{key.removeprefix('align_').removesuffix('_loss')}"
+                )
+                loss_dict[metric_key] = float(value.detach().float().item())
 
-        align_scale = float(self.config.vjepa_align_loss_scale) if align_loss is not None else 0.0
+        align_scale = self.config.alignment_loss_scale if align_loss is not None else 0.0
+        action_raw = losses.mean()
+        align_raw = align_loss if align_loss is not None else losses.new_zeros(())
+        loss_dict.update(_loss_metrics(action_raw, align_loss, align_scale))
+
+        if return_loss_tensors:
+            loss_dict["_loss_tensors"] = {
+                "action_loss": action_raw,
+                "align_loss": align_raw,
+            }
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
             if align_loss is not None:
                 per_sample_loss = per_sample_loss + align_scale * align_loss
-            loss_dict["loss"] = per_sample_loss.mean().item()
+            loss_dict["loss"] = float(per_sample_loss.mean().item())
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss
             loss = losses.mean()
             if align_loss is not None:
                 loss = loss + align_scale * align_loss
-            loss_dict["loss"] = loss.item()
+            loss_dict["loss"] = float(loss.item())
             return loss, loss_dict
 
     def _prepare_vjepa_video(self, vlm_images: list[Tensor]) -> Tensor:
@@ -1467,20 +1761,24 @@ class PI05Policy(PreTrainedPolicy):
             raise RuntimeError("V-JEPA encoder returned no hidden states for alignment")
         return layer_tokens
 
-    def _compute_vjepa_align_loss(
+    def _compute_alignment_loss(
         self,
         scene_hiddens: list[Tensor],
         teacher_layers: list[Tensor],
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        projector = self.model.vjepa_align_projector
+        backend = self.config.alignment_backend
+        projector = getattr(self.model, f"{backend}_align_projector")
         if projector is None:
-            raise RuntimeError("V-JEPA align projector is not initialized")
-        expected_len = self.model.vjepa_scene_len
-        loss_type = self.config.vjepa_align_loss_type
+            raise RuntimeError(f"{backend} align projector is not initialized")
+        expected_len = self.model.active_scene_len
+        loss_type = getattr(self.config, f"{backend}_align_loss_type")
+        pairs = self.model.vjepa_layer_pairs if backend == "vjepa" else self.model.alignment_layer_pairs
+        if any(target.ndim != 3 or target.shape[1] != expected_len for target in teacher_layers):
+            raise ValueError(f"{backend} teacher token layout does not match scene queries")
 
-        if self.config.vjepa_use_layerwise_alignment:
+        if getattr(self.config, f"{backend}_use_layerwise_alignment"):
             results = []
-            for student_idx, teacher_idx in self.model.vjepa_layer_pairs:
+            for student_idx, teacher_idx in pairs:
                 scene = scene_hiddens[student_idx - 1]
                 if scene.shape[1] != expected_len:
                     raise RuntimeError(

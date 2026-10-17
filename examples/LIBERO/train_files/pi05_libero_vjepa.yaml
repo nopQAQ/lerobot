@@ -1,8 +1,8 @@
-# π₀.₅ + V-JEPA prefix scene tokens  pi05_base -> pi05_libero
+# π₀.₅ + V-JEPA scene tokens after the action suffix  pi05_base -> pi05_libero
 # LeRobot does not load this YAML. Keep it in sync with run_pi05_libero_vjepa_train.sh.
 #
 # Same OpenPI pi05_libero recipe as pi05_libero.yaml, plus frozen V-JEPA2 alignment
-# on 256 PaliGemma prefix scene queries (starVLA QwenOFT vjepa path).
+# on 256 PaliGemma scene queries after the action suffix (starVLA QwenOFT vjepa path).
 #
 # OpenPI official (src/openpi/training/config.py, name="pi05_libero"):
 #   start from pi05_base
@@ -15,14 +15,16 @@
 #
 # V-JEPA (lerobot PI05Policy, QwenOFT-compatible defaults):
 #   frozen vjepa2-vitl-fpc64-256
-#   8-frame primary-camera clip, 256px, tubelet=2 -> scene_len=256
-#   layerwise uniform align, cosine, scale=0.5
-#   scene queries attend only to image+language; VLM and action cannot attend to scene
+#   8-frame primary-camera clip, 256px, tubelet=2 -> 4 temporal embeddings x 8x8 spatial copies = scene_len=256
+#   scene_query init: vocab-mean of PaliGemma embeddings (VLA-JEPA add_new_tokens avg)
+#   layerwise uniform align, cosine, scale=0.4, vjepa_align_projector_lr=1e-4
+#   scene queries sit after the action suffix: [image | language | action | scene]
+#   scene queries attend only to image+language (not action, not other scene tokens); VLM and action cannot attend to scene
 #   scene tokens do not shift action RoPE positions
 #   float [0,1] clips use do_rescale=false in AutoVideoProcessor
 #   training-only branch: inference inserts no scene tokens and loads no V-JEPA teacher
 
-run_id: pi05_base_libero_vjepa_v2
+run_id: pi05_base_libero_vjepa_v3
 run_root_dir: results/libero_PI
 seed: 42
 wandb_entity: null
@@ -61,13 +63,17 @@ policy:
   vjepa_enabled: true
   vjepa_model_path: /mnt/nas/code/starVLA/playground/Pretrained_models/vjepa2-vitl-fpc64-256
   vjepa_align_loss_type: cosine
-  vjepa_align_loss_scale: 0.5
+  vjepa_align_loss_scale: 0.4
+  vjepa_align_projector_lr: 1.0e-04
   vjepa_use_layerwise_alignment: true
   vjepa_layer_mapping: uniform
   vjepa_num_frames: 8
   vjepa_spatial_pool_size: 8
   vjepa_video_resolution: 256
   vjepa_use_video_clip: true    # primary-camera future 8 frames via observation_delta_indices
+  grad_conflict_enabled: true
+  grad_conflict_freq: 100
+  grad_conflict_scope: paligemma_language_model
 
 datasets:
   repo_id: HuggingFaceVLA/libero   # LeRobot copy of physical-intelligence/libero
@@ -84,7 +90,7 @@ trainer:
   max_train_steps: 30000
   batch_size: 32                # per GPU; OpenPI global batch = 8×32 = 256
   num_workers: 4
-  save_interval: 5000
+  save_interval: 30000            # only keep the final 30k checkpoint
   log_freq: 100                 # OpenPI log_interval=100
   env_eval_freq: 0
   eval_n_episodes: 10

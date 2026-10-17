@@ -34,9 +34,62 @@ from lerobot.processor import (
     make_policy_processor_pipelines,
 )
 from lerobot.types import EnvTransition, TransitionKey
-from lerobot.utils.constants import OBS_STATE
+from lerobot.utils.constants import OBS_LANGUAGE_TOKENS, OBS_STATE
 
 from .configuration_pi05 import PI05Config
+
+INSTRUCTION_MASK = "observation.language.instruction_mask"
+
+
+@ProcessorStepRegistry.register(name="pi05_alignment_tokenizer_processor")
+@dataclass
+class Pi05AlignmentTokenizerProcessorStep(TokenizerProcessorStep):
+    """Keep exact instruction spans separate from PI05's serialized state."""
+
+    def observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        output = super().observation(observation)
+        tasks = self.get_task(self.transition)
+        raw_tasks = self.transition[TransitionKey.COMPLEMENTARY_DATA]["raw_task"]
+        encoded = self.input_tokenizer(
+            tasks,
+            max_length=self.max_length,
+            truncation=self.truncation,
+            padding=self.padding,
+            padding_side=self.padding_side,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        ids = output[OBS_LANGUAGE_TOKENS]
+        if not torch.equal(encoded["input_ids"].to(ids.device), ids):
+            raise RuntimeError("Instruction offsets do not match PI05 language tokens")
+        offsets = encoded["offset_mapping"]
+        ends = torch.tensor(
+            [6 + len(task.strip().replace("_", " ").replace("\n", " ")) for task in raw_tasks]
+        )
+        # Include the leading space of a SentencePiece word, but never state or prompt markers.
+        mask = (offsets[:, :, 1] > 6) & (offsets[:, :, 0] >= 5) & (offsets[:, :, 1] <= ends[:, None])
+        mask &= encoded["attention_mask"].bool()
+        output[INSTRUCTION_MASK] = mask.to(ids.device)
+        return output
+
+
+def reconcile_pi05_alignment_processor(config: PI05Config, preprocessor) -> None:
+    """Upgrade pi05_base's saved tokenizer when starting teacher finetuning."""
+    backend = config.alignment_backend
+    if backend not in {"vggtomega", "locateanything"}:
+        return
+    if getattr(config, f"{backend}_scene_attention_mask_mode") != "image_and_instruction":
+        return
+    for index, step in enumerate(preprocessor.steps):
+        if type(step) is TokenizerProcessorStep:
+            kwargs = step.get_config()
+            preprocessor.steps[index] = Pi05AlignmentTokenizerProcessorStep(
+                **kwargs,
+                tokenizer=step.input_tokenizer,
+            )
+            # Save a reloadable tokenizer name, rather than the transient tokenizer object.
+            preprocessor.steps[index].tokenizer = None
+            preprocessor.steps[index].tokenizer_name = step.tokenizer_name
 
 
 @ProcessorStepRegistry.register(name="pi05_prepare_state_tokenizer_processor_step")
@@ -58,6 +111,8 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
         tasks = transition.get(TransitionKey.COMPLEMENTARY_DATA, {}).get(self.task_key)
         if tasks is None:
             raise ValueError("No task found in complementary data")
+        transition[TransitionKey.COMPLEMENTARY_DATA] = dict(transition[TransitionKey.COMPLEMENTARY_DATA])
+        transition[TransitionKey.COMPLEMENTARY_DATA]["raw_task"] = list(tasks)
 
         # TODO: check if this necessary
         state = deepcopy(state)
@@ -155,4 +210,8 @@ def make_pi05_pre_post_processors(
         steps.to_cpu,
     ]
 
-    return make_policy_processor_pipelines(input_steps=input_steps, output_steps=output_steps)
+    preprocessor, postprocessor = make_policy_processor_pipelines(
+        input_steps=input_steps, output_steps=output_steps
+    )
+    reconcile_pi05_alignment_processor(config, preprocessor)
+    return preprocessor, postprocessor

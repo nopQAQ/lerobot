@@ -101,7 +101,8 @@ fi
 
 steps="${STEPS:-30000}"
 batch_size="${BATCH_SIZE:-32}"
-save_freq="${SAVE_FREQ:-5000}"
+# Default: only keep the final checkpoint (LeRobot also always saves at step==steps).
+save_freq="${SAVE_FREQ:-${steps}}"
 wandb_enable="${WANDB_ENABLE:-true}"
 num_workers="${NUM_WORKERS:-4}"
 effective_batch="$((batch_size * num_processes))"

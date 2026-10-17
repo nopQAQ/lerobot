@@ -19,7 +19,12 @@ import copy
 import logging
 import shutil
 from pathlib import Path
-from typing import Any, NotRequired, TypedDict
+from typing import Any, TypedDict
+
+try:
+    from typing import NotRequired
+except ImportError:
+    from typing_extensions import NotRequired
 
 import datasets
 import pandas as pd
@@ -52,8 +57,8 @@ from .video_utils import concatenate_video_files, get_video_duration_in_s
 
 logger = logging.getLogger(__name__)
 
-type FeatureDict = dict[str, dict[str, Any]]
-type ChunkFile = tuple[int, int]
+FeatureDict = dict[str, dict[str, Any]]
+ChunkFile = tuple[int, int]
 
 
 class IndexState(TypedDict):
@@ -72,7 +77,7 @@ class VideoIndex(TypedDict):
     dst_file_durations: NotRequired[dict[ChunkFile, float]]
 
 
-type VideoIndexState = dict[str, VideoIndex]
+VideoIndexState = dict[str, VideoIndex]
 
 
 def merge_video_feature_info_for_aggregate(all_metadata: list[LeRobotDatasetMetadata]) -> FeatureDict:

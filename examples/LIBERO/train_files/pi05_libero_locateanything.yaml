@@ -1,0 +1,72 @@
+# PI05 + frozen locateanything; hyperparameter sheet for the matching run script.
+run_id: pi05_base_libero_locateanything
+run_root_dir: results/libero_PI
+seed: 42
+wandb_entity: null
+wandb_project: lerobot_liberoPI
+is_debug: false
+
+policy:
+  type: pi05
+  pretrained_path: /mnt/nas/code/models/lerobot_pi05_base
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  compile_model: false          # PPU: keep false (OpenPI has no torch.compile)
+  gradient_checkpointing: true
+  freeze_vision_encoder: false
+  train_expert_only: false
+  chunk_size: 10                # OpenPI action_horizon=10
+  n_action_steps: 10
+  use_relative_actions: false   # OpenPI extra_delta_transform=False (LIBERO already delta)
+  normalization_mapping:
+    ACTION: MEAN_STD
+    STATE: MEAN_STD
+    VISUAL: IDENTITY
+  optimizer_lr: 5.0e-05         # OpenPI peak_lr
+  optimizer_betas: [0.9, 0.95]
+  optimizer_eps: 1.0e-08
+  optimizer_weight_decay: 1.0e-10
+  optimizer_grad_clip_norm: 1.0
+  scheduler_warmup_steps: 10000
+  scheduler_decay_steps: 30000  # = steps, so LeRobot will not auto-scale warmup
+  scheduler_decay_lr: 5.0e-05   # = peak_lr: flat 5e-5 after warmup (OpenPI decay_lr=peak)
+  empty_cameras: 0
+  rename_map:
+    observation.images.image: observation.images.base_0_rgb
+    observation.images.image2: observation.images.left_wrist_0_rgb
+  locateanything_enabled: true
+  locateanything_align_loss_type: cosine
+  locateanything_align_loss_scale: 0.1
+  locateanything_align_projector_lr: 1.0e-04
+  locateanything_use_layerwise_alignment: true
+  locateanything_layer_mapping: uniform
+  locateanything_use_target_norm: false
+  locateanything_model_path: /mnt/nas/code/starVLA/playground/Pretrained_models/LocateAnything-3B
+  locateanything_attn_implementation: sdpa
+  locateanything_scene_attention_mask_mode: image_and_instruction
+  grad_conflict_enabled: true
+  grad_conflict_freq: 100
+  grad_conflict_scope: paligemma_language_model
+
+datasets:
+  repo_id: HuggingFaceVLA/libero   # LeRobot copy of physical-intelligence/libero
+  root: playground/Datasets/HuggingFaceVLA/libero
+  video_backend: torchcodec
+
+env:
+  type: libero
+  task: libero_spatial,libero_object,libero_goal,libero_10
+  control_mode: relative
+
+trainer:
+  num_gpus: 8
+  max_train_steps: 30000
+  batch_size: 32                # per GPU; OpenPI global batch = 8×32 = 256
+  num_workers: 4
+  save_interval: 30000            # only keep the final 30k checkpoint
+  log_freq: 100                 # OpenPI log_interval=100
+  env_eval_freq: 0
+  eval_n_episodes: 10
+  eval_batch_size: 1
+  wandb_enable: true

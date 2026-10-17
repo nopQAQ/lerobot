@@ -218,6 +218,10 @@ def make_pre_post_processors(
             revision=pretrained_revision,
         )
         _reconnect_relative_absolute_steps(preprocessor, postprocessor)
+        if policy_cfg.type == "pi05":
+            from .pi05.processor_pi05 import reconcile_pi05_alignment_processor
+
+            reconcile_pi05_alignment_processor(policy_cfg, preprocessor)
         if isinstance(policy_cfg, Evo1Config):
             from .evo1.processor_evo1 import reconcile_evo1_processors
 

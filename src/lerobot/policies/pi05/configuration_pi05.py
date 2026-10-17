@@ -103,12 +103,17 @@ class PI05Config(PreTrainedConfig):
 
     tokenizer_max_length: int = 200  # see openpi `__post_init__`
 
-    # Frozen V-JEPA2 alignment on PaliGemma prefix scene queries (off by default).
-    # Scene tokens are concatenated in embed_prefix; they are not PaliGemma text tokens.
+    # Frozen V-JEPA2 alignment on PaliGemma scene queries (off by default).
+    # One learnable embedding per temporal tubelet, repeated over the spatial
+    # grid (VLA-JEPA <|action_i|> style). Initialized from the mean of the
+    # PaliGemma language embedding table. Tokens sit after the action suffix.
     vjepa_enabled: bool = False
     vjepa_model_path: str = "/mnt/nas/code/starVLA/playground/Pretrained_models/vjepa2-vitl-fpc64-256"
     vjepa_align_loss_type: str = "cosine"
-    vjepa_align_loss_scale: float = 0.5
+    vjepa_align_loss_scale: float = 0.4
+    # Dedicated LR for the trainable AlignProjector (starVLA QwenOFT uses 1e-4).
+    # The rest of PI0.5 still uses optimizer_lr. Set equal to optimizer_lr to disable.
+    vjepa_align_projector_lr: float = 1e-4
     vjepa_use_layerwise_alignment: bool = True
     vjepa_layer_mapping: str = "uniform"
     vjepa_include_at_inference: bool = False
@@ -118,6 +123,42 @@ class PI05Config(PreTrainedConfig):
     # False: repeat the current primary-camera frame (bring-up). True: stack
     # observation_delta_indices frames and use the primary camera clip.
     vjepa_use_video_clip: bool = False
+
+    # Single-teacher alternatives, matching starVLA-single's main-view experiments.
+    vggtomega_enabled: bool = False
+    vggtomega_source_path: str = "/mnt/nas/code/starVLA/third_party/vggtomega"
+    vggtomega_checkpoint_path: str = "/mnt/nas/code/starVLA/third_party/vggtomega/vggt_omega_1b_512.pt"
+    vggtomega_num_frames: int = 8
+    vggtomega_image_size: int = 224
+    vggtomega_align_loss_type: str = "cosine"
+    vggtomega_align_loss_scale: float = 0.05
+    vggtomega_align_projector_lr: float = 1e-4
+    vggtomega_use_layerwise_alignment: bool = True
+    vggtomega_layer_mapping: str = "uniform"
+    vggtomega_use_target_norm: bool = False
+    vggtomega_scene_attention_mask_mode: str = "image_only"
+
+    locateanything_enabled: bool = False
+    locateanything_model_path: str = "/mnt/nas/code/starVLA/playground/Pretrained_models/LocateAnything-3B"
+    locateanything_attn_implementation: str = "sdpa"
+    locateanything_prompt_template: str = (
+        "Locate all the instances that matches the following description: {text}."
+    )
+    locateanything_align_loss_type: str = "cosine"
+    locateanything_align_loss_scale: float = 0.1
+    locateanything_align_projector_lr: float = 1e-4
+    locateanything_use_layerwise_alignment: bool = True
+    locateanything_layer_mapping: str = "uniform"
+    locateanything_use_target_norm: bool = False
+    locateanything_scene_attention_mask_mode: str = "image_and_instruction"
+    # Persist architecture metadata so action inference never needs teacher files.
+    locateanything_teacher_dim: int = 2048
+    locateanything_teacher_layers: int = 36
+
+    # Low-frequency action/alignment gradient diagnostics (disabled by default).
+    grad_conflict_enabled: bool = False
+    grad_conflict_freq: int = 100
+    grad_conflict_scope: str = "paligemma_language_model"
 
     def __post_init__(self):
         super().__post_init__()
@@ -138,6 +179,29 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"Invalid dtype: {self.dtype}")
 
         allowed_align = {"l1", "mse", "cosine", "smooth_l1", "mse_cosine", "cosine_mse"}
+        enabled = [
+            name for name in ("vjepa", "vggtomega", "locateanything") if getattr(self, f"{name}_enabled")
+        ]
+        if len(enabled) > 1:
+            raise ValueError(f"PI05 supports one alignment teacher at a time, got {enabled}")
+        for name in ("vggtomega", "locateanything"):
+            if getattr(self, f"{name}_align_loss_type") not in allowed_align:
+                raise ValueError(f"Invalid {name}_align_loss_type")
+            if getattr(self, f"{name}_align_loss_scale") < 0:
+                raise ValueError(f"{name}_align_loss_scale must be >= 0")
+            if getattr(self, f"{name}_align_projector_lr") <= 0:
+                raise ValueError(f"{name}_align_projector_lr must be > 0")
+            if getattr(self, f"{name}_scene_attention_mask_mode") not in {
+                "image_only",
+                "image_and_instruction",
+            }:
+                raise ValueError(f"Unsupported {name}_scene_attention_mask_mode")
+        if self.vggtomega_num_frames < 1 or self.vggtomega_image_size < 16 or self.vggtomega_image_size % 16:
+            raise ValueError("VGGT requires >= 1 frame and an image size divisible by 16")
+        if self.locateanything_teacher_dim < 1 or self.locateanything_teacher_layers < 1:
+            raise ValueError("LocateAnything architecture dimensions must be positive")
+        if self.locateanything_enabled and not self.locateanything_use_layerwise_alignment:
+            raise ValueError("LocateAnything requires use_layerwise_alignment=true, as in starVLA-single")
         if self.vjepa_align_loss_type not in allowed_align:
             raise ValueError(
                 f"Invalid vjepa_align_loss_type: {self.vjepa_align_loss_type}. "
@@ -146,9 +210,15 @@ class PI05Config(PreTrainedConfig):
         if self.vjepa_num_frames < 2:
             raise ValueError(f"vjepa_num_frames must be >= 2, got {self.vjepa_num_frames}")
         if self.vjepa_spatial_pool_size < 1:
-            raise ValueError(
-                f"vjepa_spatial_pool_size must be >= 1, got {self.vjepa_spatial_pool_size}"
-            )
+            raise ValueError(f"vjepa_spatial_pool_size must be >= 1, got {self.vjepa_spatial_pool_size}")
+        if self.vjepa_align_loss_scale < 0:
+            raise ValueError(f"vjepa_align_loss_scale must be >= 0, got {self.vjepa_align_loss_scale}")
+        if self.grad_conflict_freq < 1:
+            raise ValueError(f"grad_conflict_freq must be >= 1, got {self.grad_conflict_freq}")
+        if self.grad_conflict_scope != "paligemma_language_model":
+            raise ValueError(f"Unsupported grad_conflict_scope: {self.grad_conflict_scope}")
+        if self.vjepa_align_projector_lr <= 0:
+            raise ValueError(f"vjepa_align_projector_lr must be > 0, got {self.vjepa_align_projector_lr}")
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
@@ -192,7 +262,21 @@ class PI05Config(PreTrainedConfig):
         )
 
     @property
+    def alignment_backend(self) -> str | None:
+        return next(
+            (name for name in ("vjepa", "vggtomega", "locateanything") if getattr(self, f"{name}_enabled")),
+            None,
+        )
+
+    @property
+    def alignment_loss_scale(self) -> float:
+        backend = self.alignment_backend
+        return float(getattr(self, f"{backend}_align_loss_scale")) if backend else 0.0
+
+    @property
     def observation_delta_indices(self) -> list[int] | None:
+        if self.vggtomega_enabled:
+            return list(range(self.vggtomega_num_frames))
         if self.vjepa_enabled and self.vjepa_use_video_clip:
             return list(range(self.vjepa_num_frames))
         return None

@@ -21,19 +21,21 @@ export HF_HUB_DISABLE_SYMLINKS="${HF_HUB_DISABLE_SYMLINKS:-1}"
 # ==============================================================================
 # 2. 运行路径与输出配置 (Paths Config)
 # OpenPI official: pi05_base -> pi05_libero, plus training-only frozen V-JEPA prefix alignment
-# Scene reads image/language only; VLM/action cannot read scene. Inference stays plain PI0.5.
+# Scene reads only image/language (not action or other scene tokens); VLM/action cannot read scene. Inference stays plain PI0.5.
 #   8 GPU, per-GPU batch 32 (global 256), 30000 steps, lr 5e-5
 # ==============================================================================
-RUN_ID="${RUN_ID:-$(date +%m%d)_pi05_base_libero_vjepa_v2}"
+RUN_ID="${RUN_ID:-$(date +%m%d)_pi05_base_libero_vjepa_v3}"
 RUN_ROOT_DIR="${RUN_ROOT_DIR:-${LEROBOT_ROOT}/results/libero_PI}"
 export OUTPUT_DIR="${OUTPUT_DIR:-${RUN_ROOT_DIR}/${RUN_ID}}"
 export STEPS="${STEPS:-30000}"
 export BATCH_SIZE="${BATCH_SIZE:-32}"
-export SAVE_FREQ="${SAVE_FREQ:-5000}"
+export SAVE_FREQ="${SAVE_FREQ:-${STEPS}}"
 export NUM_WORKERS="${NUM_WORKERS:-4}"
 export PI05_PRETRAINED="${PI05_PRETRAINED:-/mnt/nas/code/models/lerobot_pi05_base}"
 export VJEPA_MODEL_PATH="${VJEPA_MODEL_PATH:-/mnt/nas/code/starVLA/playground/Pretrained_models/vjepa2-vitl-fpc64-256}"
 export VJEPA_USE_VIDEO_CLIP="${VJEPA_USE_VIDEO_CLIP:-true}"
+export VJEPA_ALIGN_LOSS_SCALE="${VJEPA_ALIGN_LOSS_SCALE:-0.4}"
+export VJEPA_ALIGN_PROJECTOR_LR="${VJEPA_ALIGN_PROJECTOR_LR:-1e-4}"
 
 # ==============================================================================
 # 3. 分布式与硬件加速配置 (Distributed/NCCL Config)
@@ -133,6 +135,8 @@ log "  OUTPUT_DIR        : $OUTPUT_DIR"
 log "  PI05_PRETRAINED   : $PI05_PRETRAINED"
 log "  VJEPA_MODEL_PATH  : $VJEPA_MODEL_PATH"
 log "  VJEPA_USE_VIDEO_CLIP: $VJEPA_USE_VIDEO_CLIP"
+log "  VJEPA_ALIGN_LOSS_SCALE: $VJEPA_ALIGN_LOSS_SCALE"
+log "  VJEPA_ALIGN_PROJECTOR_LR: $VJEPA_ALIGN_PROJECTOR_LR"
 log "  NUM_PROCESSES     : $NUM_PROCESSES  (available=${AVAILABLE_GPUS}, OpenPI=8)"
 log "  BATCH_SIZE        : $BATCH_SIZE per GPU  (effective=$((BATCH_SIZE * NUM_PROCESSES)), OpenPI=256)"
 log "  STEPS             : $STEPS  (OpenPI=30000)"

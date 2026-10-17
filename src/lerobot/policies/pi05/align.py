@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen-teacher alignment helpers for PI05 prefix scene tokens.
+"""Frozen-teacher alignment helpers for PI05 scene tokens.
 
 Copied from starVLA QwenOFT (`projectors.AlignProjector` and layer-mapping
 utilities) so lerobot does not import the starVLA package.
@@ -277,6 +277,87 @@ def build_align_layer_pairs(
 
     pairs = [(int(s), int(t) - 1) for s, t in zip(student_layers, teacher_layers)]
     return _dedupe_align_layer_pairs_by_teacher(pairs)
+
+
+@torch.no_grad()
+def scene_query_embedding_consistency_stats(weight: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Pairwise cosine among the learned per-tubelet scene query rows."""
+    rows = F.normalize(weight.detach().float(), dim=-1, eps=1e-6)
+    sim = rows @ rows.T
+    n = rows.shape[0]
+    if n <= 1:
+        return {
+            "scene_prealign/query_pairwise_cosine": sim.new_tensor(1.0),
+            "scene_prealign/query_row_std": weight.detach().float().std(dim=0, correction=0).mean(),
+        }
+    off_diag = ~torch.eye(n, dtype=torch.bool, device=sim.device)
+    return {
+        "scene_prealign/query_pairwise_cosine": sim[off_diag].mean(),
+        "scene_prealign/query_row_std": weight.detach().float().std(dim=0).mean(),
+    }
+
+
+@torch.no_grad()
+def scene_prealign_consistency_stats(
+    scene: torch.Tensor,
+    temporal_tokens: int,
+) -> Dict[str, torch.Tensor]:
+    """Measure whether pre-projector scene tokens still share the same vector.
+
+    Scene layout is ``[t0 x S | t1 x S | ...]``. At init the four tubelet embeddings
+    are identical (vocab-mean copies), so within- and between-tubelet cosine should
+    both be ~1 before the VLM layers; RoPE + image/language attention can break that.
+    """
+    if scene.ndim != 3:
+        raise ValueError(f"scene must be [B, L, D], got {tuple(scene.shape)}")
+    batch, length, _hidden = scene.shape
+    if temporal_tokens <= 0 or length % temporal_tokens != 0:
+        raise ValueError(
+            f"scene length {length} is not divisible by temporal_tokens {temporal_tokens}"
+        )
+    spatial = length // temporal_tokens
+    hidden = scene.detach().float()
+    tokens = F.normalize(hidden, dim=-1, eps=1e-6)
+    sim = torch.matmul(tokens, tokens.transpose(-1, -2))
+
+    eye = torch.eye(length, dtype=torch.bool, device=scene.device)
+    pairwise = sim[:, ~eye].mean() if length > 1 else sim.new_tensor(1.0)
+
+    grouped = hidden.view(batch, temporal_tokens, spatial, hidden.shape[-1])
+    grouped_n = F.normalize(grouped, dim=-1, eps=1e-6)
+    within = torch.matmul(grouped_n, grouped_n.transpose(-1, -2))
+    spatial_eye = torch.eye(spatial, dtype=torch.bool, device=scene.device)
+    if spatial > 1:
+        within_cosine = within[:, :, ~spatial_eye].mean()
+    else:
+        within_cosine = within.new_tensor(1.0)
+
+    tubelet_ids = torch.arange(temporal_tokens, device=scene.device).repeat_interleave(spatial)
+    same_tubelet = tubelet_ids[:, None] == tubelet_ids[None, :]
+    between_mask = ~same_tubelet
+    if between_mask.any():
+        between_cosine = sim[:, between_mask].mean()
+    else:
+        between_cosine = sim.new_tensor(1.0)
+
+    tubelet_means = grouped.mean(dim=2)
+    means_n = F.normalize(tubelet_means, dim=-1, eps=1e-6)
+    mean_sim = torch.matmul(means_n, means_n.transpose(-1, -2))
+    t_eye = torch.eye(temporal_tokens, dtype=torch.bool, device=scene.device)
+    if temporal_tokens > 1:
+        tubelet_mean_cosine = mean_sim[:, ~t_eye].mean()
+    else:
+        tubelet_mean_cosine = mean_sim.new_tensor(1.0)
+
+    return {
+        "scene_prealign/token_std": hidden.std(dim=1, correction=int(length > 1)).mean(),
+        "scene_prealign/pairwise_cosine": pairwise,
+        "scene_prealign/within_tubelet_cosine": within_cosine,
+        "scene_prealign/between_tubelet_cosine": between_cosine,
+        "scene_prealign/tubelet_mean_cosine": tubelet_mean_cosine,
+        "scene_prealign/within_tubelet_std": grouped.std(dim=2, correction=int(spatial > 1)).mean(),
+        "scene_prealign/between_tubelet_std": tubelet_means.std(dim=1, correction=int(temporal_tokens > 1)).mean(),
+    }
 
 
 def pool_vjepa_tubelet_tokens(
